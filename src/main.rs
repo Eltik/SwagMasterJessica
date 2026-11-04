@@ -55,10 +55,10 @@ fn strip_discord_markup(text: &str) -> String {
     stripped
 }
 
-/// Returns true if the visible text contains "67" or "6 7".
+/// Returns true if the visible text contains "67", "6 7" or "six seven" in any casing.
 fn mentions_six_seven(text: &str) -> bool {
-    let visible = strip_discord_markup(text);
-    visible.contains("67") || visible.contains("6 7")
+    let visible = strip_discord_markup(text).to_lowercase();
+    visible.contains("67") || visible.contains("6 7") || visible.contains("six seven")
 }
 
 async fn react(ctx: &Context, msg: &Message, emoji: ReactionType) {
@@ -165,7 +165,17 @@ mod tests {
 
     #[test]
     fn detects_six_seven() {
-        for s in ["67", "6 7", "lol 67 lol", "1670", "<@123> 67", "a < b 67"] {
+        for s in [
+            "67",
+            "6 7",
+            "lol 67 lol",
+            "1670",
+            "<@123> 67",
+            "a < b 67",
+            "six seven",
+            "SIX Seven",
+            "lol six seven lol",
+        ] {
             assert!(mentions_six_seven(s), "{s}");
         }
     }
@@ -178,6 +188,9 @@ mod tests {
             "76",
             "6  7",
             "6-7",
+            "six",
+            "seven",
+            "seven six",
             "<@126789>",
             "<#167>",
             "<:smile:1670>",
