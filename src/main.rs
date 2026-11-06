@@ -1,8 +1,11 @@
+use std::borrow::Cow;
 use std::env;
+use std::sync::LazyLock;
 
+use regex::Regex;
 use serenity::all::{
-    Command, CreateCommand, CreateInteractionResponse, CreateInteractionResponseMessage, EmojiId,
-    Interaction, ReactionType,
+    Command, CommandType, CreateCommand, CreateInteractionResponse,
+    CreateInteractionResponseMessage, EmojiId, GuildId, Interaction, ReactionType,
 };
 use serenity::async_trait;
 use serenity::model::channel::Message;
@@ -12,9 +15,30 @@ use serenity::prelude::*;
 const BEAR_EMOJI_ID: u64 = 1519568644827250749;
 const SIX_SEVEN_EMOJI_ID: u64 = 1495252839918993569;
 
-/// Returns true if the text contains "bear" in any casing, including common
-/// look-alike spellings ("b3ar", "be@r", "BeAr", "bears", "teddybear") or the 🐻 emoji.
+const SWAG_COMMAND: &str = "swag";
+
+/// Matches `scheme://...` links, `www.` addresses and scheme-less `domain.tld/path` links.
+/// A domain with no path isn't matched, so "bear.com" or a typo like "bears.they" still
+/// counts as text. A link ends at whitespace or an angle bracket, so `<https://...>` is
+/// covered too.
+static URL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)[a-z][a-z0-9+-]*://[^\s<>]*|\bwww\.[^\s<>]+|\b[a-z0-9-]+(?:\.[a-z0-9-]+)*\.[a-z]{2,}/[^\s<>]*",
+    )
+    .expect("URL regex is valid")
+});
+
+/// Blanks out URLs, whose paths and hostnames shouldn't count as someone saying a word.
+/// Each one becomes a space so the text on either side can't join into a false match.
+fn strip_urls(text: &str) -> Cow<'_, str> {
+    URL.replace_all(text, " ")
+}
+
+/// Returns true if the text outside URLs contains "bear" or "ursus" in any casing,
+/// including common look-alike spellings ("b3ar", "be@r", "BeAr", "bears", "teddybear")
+/// or the 🐻 emoji.
 fn mentions_bear(text: &str) -> bool {
+    let text = strip_urls(text);
     if text.contains('🐻') {
         return true;
     }
@@ -28,7 +52,7 @@ fn mentions_bear(text: &str) -> bool {
             _ => c,
         })
         .collect();
-    normalized.contains("bear")
+    normalized.contains("bear") || normalized.contains("ursus")
 }
 
 /// Removes mentions, custom emoji, timestamps and similar markup from raw message
@@ -55,10 +79,32 @@ fn strip_discord_markup(text: &str) -> String {
     stripped
 }
 
-/// Returns true if the visible text contains "67", "6 7" or "six seven" in any casing.
+/// Returns true if the visible text outside URLs contains "67", "6 7" or "six seven"
+/// in any casing.
 fn mentions_six_seven(text: &str) -> bool {
-    let visible = strip_discord_markup(text).to_lowercase();
+    let visible = strip_discord_markup(&strip_urls(text)).to_lowercase();
     visible.contains("67") || visible.contains("6 7") || visible.contains("six seven")
+}
+
+/// Deletes guild-scoped copies of /swag. Discord lists guild and global commands side by
+/// side, so a copy left by an older registration shows up as a second /swag.
+async fn remove_guild_swag_commands(ctx: &Context, guild_id: GuildId) {
+    let commands = match guild_id.get_commands(&ctx.http).await {
+        Ok(commands) => commands,
+        Err(why) => {
+            eprintln!("Failed to list commands for guild {guild_id}: {why:?}");
+            return;
+        }
+    };
+    for command in commands
+        .iter()
+        .filter(|c| c.kind == CommandType::ChatInput && c.name == SWAG_COMMAND)
+    {
+        match guild_id.delete_command(&ctx.http, command.id).await {
+            Ok(()) => println!("Removed duplicate /swag from guild {guild_id}"),
+            Err(why) => eprintln!("Failed to remove /swag from guild {guild_id}: {why:?}"),
+        }
+    }
 }
 
 async fn react(ctx: &Context, msg: &Message, emoji: ReactionType) {
@@ -97,7 +143,7 @@ impl EventHandler for Handler {
         let Interaction::Command(command) = interaction else {
             return;
         };
-        if command.data.name == "swag" {
+        if command.data.name == SWAG_COMMAND {
             let response = CreateInteractionResponse::Message(
                 CreateInteractionResponseMessage::new().content("Swag"),
             );
@@ -109,10 +155,17 @@ impl EventHandler for Handler {
 
     async fn ready(&self, ctx: Context, ready: Ready) {
         println!("{} is connected", ready.user.name);
-        let swag = CreateCommand::new("swag").description("Swag");
+        let swag = CreateCommand::new(SWAG_COMMAND).description("Swag");
         match Command::create_global_command(&ctx.http, swag).await {
             Ok(_) => println!("Registered /swag"),
-            Err(why) => eprintln!("Failed to register /swag: {why:?}"),
+            Err(why) => {
+                // Keep any guild copies: they'd be the only working /swag left.
+                eprintln!("Failed to register /swag: {why:?}");
+                return;
+            }
+        }
+        for guild in &ready.guilds {
+            remove_guild_swag_commands(&ctx, guild.id).await;
         }
     }
 }
@@ -151,6 +204,18 @@ mod tests {
             "be@r",
             "8ear",
             "🐻",
+            "<:bear:123>",
+            "ursus",
+            "URSUS",
+            "Ursus arctos",
+            "bear https://example.com",
+            "https://example.com bear",
+            "ursus https://example.com",
+            "[bear](https://example.com)",
+            "https://example.com/bear bear",
+            "bear.https://example.com",
+            "bear.com",
+            "bears.they rock",
         ] {
             assert!(mentions_bear(s), "{s}");
         }
@@ -158,7 +223,25 @@ mod tests {
 
     #[test]
     fn ignores_non_bear() {
-        for s in ["hello", "bee", "b e a r", "bar"] {
+        for s in [
+            "hello",
+            "bee",
+            "b e a r",
+            "bar",
+            "urs us",
+            "https://example.com/bear",
+            "HTTPS://BEAR.COM",
+            "<https://bear.com>",
+            "[link](https://bear.com)",
+            "www.bear.com/cubs",
+            "https://b3ar.io",
+            "https://example.com/🐻",
+            "https://ursus.example.com",
+            "steam://run/bear",
+            "discord.gg/bear",
+            "www.example.com/bear",
+            "b3ar.io/cubs",
+        ] {
             assert!(!mentions_bear(s), "{s}");
         }
     }
@@ -175,6 +258,14 @@ mod tests {
             "six seven",
             "SIX Seven",
             "lol six seven lol",
+            "67 https://example.com",
+            "https://example.com 67",
+            "[67](https://example.com)",
+            "https://example.com/67 6 7",
+            "awww.67",
+            "3.14/67",
+            "and/or 67",
+            "67.com",
         ] {
             assert!(mentions_six_seven(s), "{s}");
         }
@@ -196,6 +287,16 @@ mod tests {
             "<:smile:1670>",
             "<a:wave:1670>",
             "<t:1767225600:R>",
+            "https://x.com/user/status/1867",
+            "HTTP://EXAMPLE.COM/67",
+            "<https://example.com/67>",
+            "[link](https://example.com/67)",
+            "https://tenor.com/view/six seven",
+            "https://tenor.com/view/6-7-gif-67",
+            "www.example.com/67",
+            "6https://example.com 7",
+            "twitter.com/user/status/1867",
+            "sub.example.co.uk/67",
         ] {
             assert!(!mentions_six_seven(s), "{s}");
         }
